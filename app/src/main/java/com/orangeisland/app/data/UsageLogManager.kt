@@ -1,5 +1,4 @@
 package com.orangeisland.app.data
-
 import android.content.Context
 import com.orangeisland.app.util.DebugLog
 import kotlinx.coroutines.*
@@ -16,7 +15,6 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
-
 /**
  * In-memory ring buffer for usage logs (model calls + tool calls).
  *
@@ -27,13 +25,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Thread-safe: all mutating operations are synchronized on the internal buffer.
  */
 object UsageLogManager {
-
     private const val TAG = "UsageLogManager"
     const val MAX_SIZE = 500
-
     @Serializable
     enum class Type { MODEL, TOOL, REQUEST, CONVERSATION, SYNC, SECURITY }
-
     @Serializable
     data class Entry(
         val id: String = UUID.randomUUID().toString(),
@@ -47,18 +42,14 @@ object UsageLogManager {
         val timeFormatted: String
             get() = TIME_FORMAT.format(Date(timestamp))
     }
-
     private val _entries = MutableStateFlow<List<Entry>>(emptyList())
     val entries: StateFlow<List<Entry>> = _entries.asStateFlow()
-
     private val TIME_FORMAT = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.getDefault())
     private val json = Json { ignoreUnknownKeys = true }
-
     private lateinit var logFile: File
     private val writeScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val writeChannel = Channel<Entry>(Channel.UNLIMITED)
     private val initialized = AtomicBoolean(false)
-
     /** Must be called once during app startup (e.g. in Application.onCreate()).
      *  Restores existing logs from disk and starts the background writer. */
     fun init(context: Context) {
@@ -81,36 +72,58 @@ object UsageLogManager {
             }
         }
     }
-
+    /**
+     * Restores only the newest [MAX_SIZE] lines without loading the whole file into memory.
+     * The previous implementation used File.readLines(), which could OOM if the on-disk log
+     * became unexpectedly large.
+     */
     private fun restoreFromDisk(): List<Entry> {
         if (!::logFile.isInitialized || !logFile.exists()) return emptyList()
         return try {
-            logFile.readLines()
-                .asReversed()
-                .mapNotNull { line ->
-                    runCatching { json.decodeFromString<Entry>(line.trim()) }.getOrNull()
+            val newestLines = ArrayDeque<String>(MAX_SIZE)
+            logFile.bufferedReader(Charsets.UTF_8).useLines { lines ->
+                lines.forEach { line ->
+                    if (newestLines.size == MAX_SIZE) newestLines.removeFirst()
+                    newestLines.addLast(line)
                 }
-                .take(MAX_SIZE)
-                .reversed()
+            }
+            newestLines.mapNotNull { line ->
+                runCatching { json.decodeFromString<Entry>(line.trim()) }.getOrNull()
+            }
         } catch (e: Exception) {
             DebugLog.w(TAG, "Failed to restore logs from disk", e)
             emptyList()
         }
     }
-
+    /**
+     * Keeps the newest [MAX_SIZE] entries when the file grows beyond 2 * [MAX_SIZE].
+     * This is deliberately streaming so a corrupted or unexpectedly large log cannot consume
+     * the entire app heap merely because it needs to be truncated.
+     */
     private fun maybeTruncate() {
         try {
-            val lines = logFile.readLines()
             val limit = MAX_SIZE * 2
-            if (lines.size > limit) {
-                val keep = lines.takeLast(MAX_SIZE)
-                logFile.writeText(keep.joinToString("\n") + if (keep.isNotEmpty()) "\n" else "")
+            val keep = ArrayDeque<String>(MAX_SIZE)
+            var count = 0
+            logFile.bufferedReader(Charsets.UTF_8).useLines { lines ->
+                lines.forEach { line ->
+                    count++
+                    if (keep.size == MAX_SIZE) keep.removeFirst()
+                    keep.addLast(line)
+                }
+            }
+            if (count > limit) {
+                logFile.bufferedWriter(Charsets.UTF_8).use { writer ->
+                    keep.forEach { line ->
+                        writer.append(line)
+                        writer.newLine()
+                    }
+                }
             }
         } catch (e: Exception) {
             DebugLog.w(TAG, "Failed to truncate log file", e)
         }
     }
-
     /** Append a new log entry. If the buffer exceeds [MAX_SIZE], the oldest entries are dropped. */
     fun log(type: Type, name: String, conversationId: String? = null, details: String = "", isError: Boolean = false) {
         val safeName = sanitize(name)
@@ -128,17 +141,14 @@ object UsageLogManager {
             writeChannel.trySend(entry)
         }
     }
-
     /** Convenience shorthand for model calls. */
     fun logModel(name: String, conversationId: String? = null, details: String = "", isError: Boolean = false) {
         log(Type.MODEL, name, conversationId, details, isError)
     }
-
     /** Convenience shorthand for tool calls. */
     fun logTool(name: String, conversationId: String? = null, details: String = "", isError: Boolean = false) {
         log(Type.TOOL, name, conversationId, details, isError)
     }
-
     /** Clear all entries and the on-disk file. */
     fun clear() {
         synchronized(_entries) {
@@ -152,7 +162,6 @@ object UsageLogManager {
             }
         }
     }
-
     /**
      * Strips common sensitive patterns from log strings before they reach the buffer or disk.
      * Applied automatically inside [log] to both [name] and [details].
